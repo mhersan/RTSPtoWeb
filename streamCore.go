@@ -18,7 +18,9 @@ func StreamServerRunStreamDo(streamID string, channelID string) {
 			Storage.StreamChannelUnlock(streamID, channelID)
 		}
 	}()
-	for {
+	var retries int = 3
+
+	for i := 0; i < retries; i++ {
 		baseLogger := log.WithFields(logrus.Fields{
 			"module":  "core",
 			"stream":  streamID,
@@ -55,6 +57,7 @@ func StreamServerRunStreamDo(streamID string, channelID string) {
 		time.Sleep(2 * time.Second)
 
 	}
+	Storage.StreamDelete(streamID)
 }
 
 //StreamServerRunStream core stream
