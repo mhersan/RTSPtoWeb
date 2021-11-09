@@ -1,15 +1,29 @@
 package main
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"net/http"
 	"os"
 	"time"
 
+	jwt "github.com/appleboy/gin-jwt/v2"
 	"github.com/gin-gonic/autotls"
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/net/websocket"
 )
+
+type login struct {
+	Username string `form:"username" json:"username" binding:"required"`
+	Password string `form:"password" json:"password" binding:"required"`
+}
+
+// User demo
+type User struct {
+	UserName string
+}
+
+var identityKey = "id"
 
 //Message resp struct
 type Message struct {
@@ -25,85 +39,149 @@ func HTTPAPIServer() {
 		"func":   "RTSPServer",
 		"call":   "Start",
 	}).Infoln("Server HTTP start")
-	var public *gin.Engine
-	if !Storage.ServerHTTPDebug() {
-		gin.SetMode(gin.ReleaseMode)
-		public = gin.New()
-	} else {
-		gin.SetMode(gin.DebugMode)
-		public = gin.Default()
-	}
+
+	public := gin.New()
 
 	public.Use(CrossOrigin())
-	//Add private login password protect methods
-	privat := public.Group("/", gin.BasicAuth(gin.Accounts{Storage.ServerHTTPLogin(): Storage.ServerHTTPPassword()}))
-	public.LoadHTMLGlob(Storage.ServerHTTPDir() + "/templates/*")
 
-	/*
-		Html template
-	*/
+	// the jwt middleware
+	authMiddleware, errJwt := jwt.New(&jwt.GinJWTMiddleware{
+		Realm:       "test zone",
+		Key:         []byte("secret key"),
+		Timeout:     time.Hour,
+		MaxRefresh:  time.Hour,
+		IdentityKey: identityKey,
+		PayloadFunc: func(data interface{}) jwt.MapClaims {
+			if v, ok := data.(*User); ok {
+				return jwt.MapClaims{
+					identityKey: v.UserName,
+				}
+			}
+			return jwt.MapClaims{}
+		},
+		IdentityHandler: func(c *gin.Context) interface{} {
+			claims := jwt.ExtractClaims(c)
+			return &User{
+				UserName: claims[identityKey].(string),
+			}
+		},
+		Authenticator: func(c *gin.Context) (interface{}, error) {
+			var loginVals login
+			if errJwt := c.ShouldBind(&loginVals); errJwt != nil {
+				return "", jwt.ErrMissingLoginValues
+			}
+			userID := loginVals.Username
+			password := loginVals.Password
 
-	if Storage.ServerHTTPDemo() {
-		public.GET("/", HTTPAPIServerIndex)
-		public.GET("/pages/stream/list", HTTPAPIStreamList)
-		public.GET("/pages/stream/add", HTTPAPIAddStream)
-		public.GET("/pages/stream/edit/:uuid", HTTPAPIEditStream)
-		public.GET("/pages/player/hls/:uuid/:channel", HTTPAPIPlayHls)
-		public.GET("/pages/player/mse/:uuid/:channel", HTTPAPIPlayMse)
-		public.GET("/pages/player/webrtc/:uuid/:channel", HTTPAPIPlayWebrtc)
-		public.GET("/pages/multiview", HTTPAPIMultiview)
-		public.Any("/pages/multiview/full", HTTPAPIFullScreenMultiView)
-		public.GET("/pages/documentation", HTTPAPIServerDocumentation)
-		public.GET("/pages/login", HTTPAPIPageLogin)
-		public.GET("/pages/player/all/:uuid/:channel", HTTPAPIPlayAll)
+			hash := md5.Sum([]byte(password))
+			hashPassword := hex.EncodeToString(hash[:])
+
+			originalUser := Storage.ServerHTTPLogin()
+			originalPassword := Storage.ServerHTTPPassword()
+
+			if userID == originalUser && hashPassword == originalPassword {
+				return &User{
+					UserName: userID,
+				}, nil
+			}
+
+			return nil, jwt.ErrFailedAuthentication
+		},
+		Authorizator: func(data interface{}, c *gin.Context) bool {
+			originalUser := Storage.ServerHTTPLogin()
+
+			if v, ok := data.(*User); ok && v.UserName == originalUser {
+				return true
+			}
+
+			return false
+		},
+		Unauthorized: func(c *gin.Context, code int, message string) {
+			c.JSON(code, gin.H{
+				"code":    code,
+				"message": message,
+			})
+		},
+		// TokenLookup is a string in the form of "<source>:<name>" that is used
+		// to extract token from the request.
+		// Optional. Default value "header:Authorization".
+		// Possible values:
+		// - "header:<name>"
+		// - "query:<name>"
+		// - "cookie:<name>"
+		// - "param:<name>"
+		TokenLookup: "header: Authorization, query: token, cookie: jwt",
+		// TokenLookup: "query:token",
+		// TokenLookup: "cookie:token",
+
+		// TokenHeadName is a string in the header. Default value is "Bearer"
+		TokenHeadName: "Bearer",
+
+		// TimeFunc provides the current time. You can override it to use another time value. This is useful for testing or if your server uses a different time zone than your tokens.
+		TimeFunc: time.Now,
+	})
+
+	if errJwt != nil {
+		log.Fatal("JWT Error:" + errJwt.Error())
 	}
 
-	/*
-		Stream Control elements
-	*/
+	errInit := authMiddleware.MiddlewareInit()
 
-	privat.GET("/streams", HTTPAPIServerStreams)
-	privat.POST("/stream/:uuid/add", HTTPAPIServerStreamAdd)
-	privat.POST("/stream/:uuid/edit", HTTPAPIServerStreamEdit)
-	privat.GET("/stream/:uuid/delete", HTTPAPIServerStreamDelete)
-	privat.GET("/stream/:uuid/reload", HTTPAPIServerStreamReload)
-	privat.GET("/stream/:uuid/info", HTTPAPIServerStreamInfo)
+	if errInit != nil {
+		log.Fatal("authMiddleware.MiddlewareInit() Error:" + errInit.Error())
+	}
 
-	/*
-		Streams Multi Control elements
-	*/
+	public.POST("/login", authMiddleware.LoginHandler)
 
-	privat.POST("/streams/multi/control/add", HTTPAPIServerStreamsMultiControlAdd)
-	privat.POST("/streams/multi/control/delete", HTTPAPIServerStreamsMultiControlDelete)
-
-	/*
-		Stream Channel elements
-	*/
-
-	privat.POST("/stream/:uuid/channel/:channel/add", HTTPAPIServerStreamChannelAdd)
-	privat.POST("/stream/:uuid/channel/:channel/edit", HTTPAPIServerStreamChannelEdit)
-	privat.GET("/stream/:uuid/channel/:channel/delete", HTTPAPIServerStreamChannelDelete)
-	privat.GET("/stream/:uuid/channel/:channel/codec", HTTPAPIServerStreamChannelCodec)
-	privat.GET("/stream/:uuid/channel/:channel/reload", HTTPAPIServerStreamChannelReload)
-	privat.GET("/stream/:uuid/channel/:channel/info", HTTPAPIServerStreamChannelInfo)
-
-	/*
-		Stream video elements
-	*/
-	//HLS
-	public.GET("/stream/:uuid/channel/:channel/hls/live/index.m3u8", HTTPAPIServerStreamHLSM3U8)
-	public.GET("/stream/:uuid/channel/:channel/hls/live/segment/:seq/file.ts", HTTPAPIServerStreamHLSTS)
-	//HLS LL
-	public.GET("/stream/:uuid/channel/:channel/hlsll/live/index.m3u8", HTTPAPIServerStreamHLSLLM3U8)
-	public.GET("/stream/:uuid/channel/:channel/hlsll/live/init.mp4", HTTPAPIServerStreamHLSLLInit)
-	public.GET("/stream/:uuid/channel/:channel/hlsll/live/segment/:segment/:any", HTTPAPIServerStreamHLSLLM4Segment)
-	public.GET("/stream/:uuid/channel/:channel/hlsll/live/fragment/:segment/:fragment/:any", HTTPAPIServerStreamHLSLLM4Fragment)
-	//MSE
-	public.GET("/stream/:uuid/channel/:channel/mse", func(c *gin.Context) {
-		handler := websocket.Handler(HTTPAPIServerStreamMSE)
-		handler.ServeHTTP(c.Writer, c.Request)
+	public.NoRoute(authMiddleware.MiddlewareFunc(), func(c *gin.Context) {
+		claims := jwt.ExtractClaims(c)
+		log.Printf("NoRoute claims: %#v\n", claims)
+		c.JSON(404, gin.H{"code": "PAGE_NOT_FOUND", "message": "Page not found"})
 	})
-	public.POST("/stream/:uuid/channel/:channel/webrtc", HTTPAPIServerStreamWebRTC)
+
+	public.GET("/health", HTTPAPIServerHealth)
+
+	public.POST("/play/:uuid/channel/:channel/webrtc", HTTPAPIServerStreamWebRTC)
+
+	privat := public.Group("/auth")
+	// Refresh time can be longer than token timeout
+	privat.GET("/refresh_token", authMiddleware.RefreshHandler)
+	privat.Use(authMiddleware.MiddlewareFunc())
+	{
+		privat.GET("/hello", helloHandler)
+
+		/*
+			Stream Control elements
+		*/
+
+		privat.GET("/streams", HTTPAPIServerStreams)
+		privat.POST("/stream/:uuid/add", HTTPAPIServerStreamAdd)
+		privat.POST("/stream/:uuid/edit", HTTPAPIServerStreamEdit)
+		privat.GET("/stream/:uuid/delete", HTTPAPIServerStreamDelete)
+		privat.GET("/stream/:uuid/reload", HTTPAPIServerStreamReload)
+		privat.GET("/stream/:uuid/info", HTTPAPIServerStreamInfo)
+
+		/*
+			Streams Multi Control elements
+		*/
+
+		privat.POST("/streams/multi/control/add", HTTPAPIServerStreamsMultiControlAdd)
+		privat.POST("/streams/multi/control/delete", HTTPAPIServerStreamsMultiControlDelete)
+
+		/*
+			Stream Channel elements
+		*/
+
+		privat.POST("/stream/:uuid/channel/:channel/add", HTTPAPIServerStreamChannelAdd)
+		privat.POST("/stream/:uuid/channel/:channel/edit", HTTPAPIServerStreamChannelEdit)
+		privat.GET("/stream/:uuid/channel/:channel/delete", HTTPAPIServerStreamChannelDelete)
+		privat.GET("/stream/:uuid/channel/:channel/codec", HTTPAPIServerStreamChannelCodec)
+		privat.GET("/stream/:uuid/channel/:channel/reload", HTTPAPIServerStreamChannelReload)
+		privat.GET("/stream/:uuid/channel/:channel/info", HTTPAPIServerStreamChannelInfo)
+
+	}
+
+	//public.POST("/stream/:uuid/channel/:channel/webrtc", HTTPAPIServerStreamWebRTC)
 	/*
 		Static HTML Files Demo Mode
 	*/
@@ -154,6 +232,20 @@ func HTTPAPIServer() {
 		os.Exit(1)
 	}
 
+}
+
+func HTTPAPIServerHealth(c *gin.Context) {
+	c.IndentedJSON(200, Message{Status: 1, Payload: "OK"})
+}
+
+func helloHandler(c *gin.Context) {
+	claims := jwt.ExtractClaims(c)
+	user, _ := c.Get(identityKey)
+	c.JSON(200, gin.H{
+		"userID":   claims[identityKey],
+		"userName": user.(*User).UserName,
+		"text":     "Hello World.",
+	})
 }
 
 //HTTPAPIServerIndex index file
