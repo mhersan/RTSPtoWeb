@@ -1,5 +1,19 @@
 package main
 
+//StreamInit Delete previous run stream data
+func (obj *StorageST) StreamInit() error {
+	obj.mutex.Lock()
+	defer obj.mutex.Unlock()
+
+	obj.Streams = make(map[string]StreamST)
+
+	err := obj.SaveConfig()
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 //StreamsList list all stream
 func (obj *StorageST) StreamsList() map[string]StreamST {
 	obj.mutex.RLock()
